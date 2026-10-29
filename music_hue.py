@@ -1,163 +1,3 @@
-"""Sync a Philips Hue BLE light's colour and brightness to computer audio."""
-
-import asyncio
-import threading
-import time
-from collections import deque
-
-import numpy as np
-import sounddevice as sd
-import HueBLE
-from bleak import BleakScanner
-
-BLOCK_SIZE = 1024
-ANALYSIS_SIZE = 4096
-SEND_INTERVAL = 0.10
-BEAT_REFRACTORY = 0.24
-MIN_WARMUP_BLOCKS = 20
-SCAN_SECONDS = 12
-
-PALETTE = [
-    (0.675, 0.322),  # red
-    (0.550, 0.400),  # orange
-    (0.409, 0.518),  # green
-    (0.170, 0.340),  # turquoise
-    (0.167, 0.040),  # blue
-    (0.300, 0.150),  # purple
-    (0.380, 0.180),  # pink
-]
-
-_audio_lock = threading.Lock()
-_audio_buffer = np.zeros(ANALYSIS_SIZE, dtype=np.float32)
-_audio_sequence = 0
-_window_cache = {}
-_previous_spectrum = None
-
-
-def audio_callback(indata, frames, timing, status):
-    """Keep the audio callback lightweight; analyse audio in the main loop."""
-    global _audio_buffer, _audio_sequence
-    block = indata[:, 0].astype(np.float32, copy=True)
-    with _audio_lock:
-        if len(block) >= ANALYSIS_SIZE:
-            _audio_buffer = block[-ANALYSIS_SIZE:].copy()
-        else:
-            _audio_buffer = np.concatenate((_audio_buffer[len(block):], block))
-        _audio_sequence += 1
-
-
-def find_blackhole():
-    for index, device in enumerate(sd.query_devices()):
-        if "blackhole" in device["name"].lower() and device["max_input_channels"] > 0:
-            return index, float(device["default_samplerate"])
-    return None, None
-
-
-def _hann(size):
-    if size not in _window_cache:
-        _window_cache[size] = np.hanning(size)
-    return _window_cache[size]
-
-
-def analyse(samples, sample_rate):
-    """Return RMS, bass, mids, treble and low-frequency spectral flux."""
-    global _previous_spectrum
-    samples = samples.astype(np.float64)
-    samples = np.diff(samples, prepend=samples[0])  # reduce DC and rumble
-    spectrum = np.abs(np.fft.rfft(samples * _hann(len(samples))))
-    frequencies = np.fft.rfftfreq(len(samples), 1.0 / sample_rate)
-
-    def band_energy(low, high):
-        mask = (frequencies >= low) & (frequencies < high)
-        return float(np.sqrt(np.mean(spectrum[mask] ** 2))) if np.any(mask) else 0.0
-
-    rms = float(np.sqrt(np.mean(samples * samples)))
-    bass = band_energy(40, 160)
-    mids = band_energy(160, 2000)
-    treble = band_energy(2000, min(8000, sample_rate / 2))
-
-    if _previous_spectrum is not None and len(_previous_spectrum) == len(spectrum):
-        mask = (frequencies >= 40) & (frequencies < min(400, sample_rate / 2))
-        differences = spectrum[mask] - _previous_spectrum[mask]
-        flux = float(np.sum(differences[differences > 0]))
-    else:
-        flux = 0.0
-    _previous_spectrum = spectrum.copy()
-    return rms, bass, mids, treble, flux
-
-
-def _device_label(device):
-    name = device.name or "Unnamed Bluetooth device"
-    return f"{name} — {device.address}"
-
-
-async def discover_hue_device():
-    """Find Hue by advertised name, or let the user choose from scan results."""
-    print(f"\nBluetooth cihazları taranıyor ({SCAN_SECONDS} saniye)...")
-    devices = await BleakScanner.discover(timeout=SCAN_SECONDS)
-    if not devices:
-        print("Bluetooth cihazı bulunamadı. Lambanın açık ve yakında olduğundan emin olun.")
-        return None
-
-    hue_matches = [
-        device for device in devices
-        if any(token in (device.name or "").lower() for token in ("hue", "iris", "philips"))
-    ]
-
-    if len(hue_matches) == 1:
-        chosen = hue_matches[0]
-        print(f"Hue benzeri cihaz bulundu: {_device_label(chosen)}")
-        return chosen
-
-    if len(hue_matches) > 1:
-        candidates = hue_matches
-        print("Birden fazla Hue/Philips benzeri cihaz bulundu:")
-    else:
-        candidates = devices
-        print(
-            "Tarama adında Hue/Iris görünmedi. Bazı lambalar Bluetooth adını yayınlamaz.\n"
-            "Lütfen Hue Iris'e ait cihazı listeden seçin:"
-        )
-
-    for index, device in enumerate(candidates, start=1):
-        print(f"  {index}. {_device_label(device)}")
-
-    while True:
-        try:
-            answer = input("Cihaz numarası (çıkmak için Enter): ").strip()
-        except (EOFError, KeyboardInterrupt):
-            return None
-        if not answer:
-            return None
-        try:
-            number = int(answer)
-        except ValueError:
-            print("Lütfen listeden bir numara girin.")
-            continue
-        if 1 <= number <= len(candidates):
-            return candidates[number - 1]
-        print("Bu numara listede yok.")
-
-
-async def connect_light(retries=3):
-    for attempt in range(1, retries + 1):
-        device = await discover_hue_device()
-        if device is None:
-            return None
-        light = HueBLE.HueBleLight(device)
-        try:
-            print(f"Bluetooth bağlantısı kuruluyor ({attempt}/{retries})...")
-            await light.connect()
-            return light
-        except Exception as exc:
-            print(f"Bağlantı kurulamadı: {type(exc).__name__}: {exc}")
-            try:
-                await light.disconnect()
-            except Exception:
-                pass
-            if attempt < retries:
-                print("Tekrar denenecek...")
-                await asyncio.sleep(2)
     return None
 
 
@@ -165,13 +5,13 @@ async def main():
     global _audio_sequence
     audio_device, sample_rate = find_blackhole()
     if audio_device is None:
-        print("BlackHole 2ch bulunamadı. Kurun ve macOS ses çıkışını BlackHole içeren Multi-Output Device yapın.")
+        print("BlackHole 2ch was not found. Install it and set macOS audio output to a Multi-Output Device that includes BlackHole.")
         return
-    print(f"Ses cihazı #{audio_device}, örnekleme hızı={sample_rate:.0f} Hz")
+    print(f"Audio device #{audio_device}, sample rate={sample_rate:.0f} Hz")
 
     light = await connect_light()
     if light is None:
-        print("Hue bağlantısı kurulamadı; program kapatılıyor.")
+        print("Could not connect to the Hue light. Exiting.")
         return
 
     connected = True
@@ -189,9 +29,9 @@ async def main():
         warmup = 0
         smoothed_rms = 0.0
 
-        print("\nMüzik senkronizasyonu başladı.")
-        print("YouTube veya başka bir uygulamada müzik açın.")
-        print("Durdurmak için Ctrl+C — çıkışta ışık kapatılmaya çalışılır.\n")
+        print("\nMusic synchronization started.")
+        print("Play music in YouTube or another app.")
+        print("Press Ctrl+C to stop — the light will be turned off on exit if possible.\n")
 
         with sd.InputStream(
             device=audio_device,
@@ -257,33 +97,32 @@ async def main():
                         last_brightness = target_brightness
                         last_send = time.monotonic()
                     except Exception as exc:
-                        print(f"Bluetooth komut hatası: {type(exc).__name__}: {exc}")
+                        print(f"Bluetooth command error: {type(exc).__name__}: {exc}")
                         raise
 
     except asyncio.CancelledError:
         raise
     except KeyboardInterrupt:
-        print("\nSenkronizasyon durduruluyor...")
+        print("\nStopping synchronization...")
     except Exception as exc:
-        print(f"Program hatası: {type(exc).__name__}: {exc}")
+        print(f"Program error: {type(exc).__name__}: {exc}")
     finally:
         if connected:
-            print("Işık kapatılıyor...")
+            print("Turning off the light...")
             try:
                 await light.set_power(False)
                 await asyncio.sleep(0.5)
-                print("Kapatma komutu gönderildi.")
+                print("The turn-off command was sent.")
             except Exception as exc:
-                print(f"Işık kapatılamadı: {type(exc).__name__}: {exc}")
+                print(f"Could not turn off the light: {type(exc).__name__}: {exc}")
             try:
                 await light.disconnect()
             except Exception as exc:
-                print(f"Bluetooth bağlantısı kapatılamadı: {exc}")
-        print("Program sonlandı.")
+                print(f"Could not close the Bluetooth connection: {exc}")
+        print("Program finished.")
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        pass
